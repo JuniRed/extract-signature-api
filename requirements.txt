@@ -1,0 +1,6 @@
+Flask
+gunicorn
+opencv-python
+numpy
+PyMuPDF
+Pillow
