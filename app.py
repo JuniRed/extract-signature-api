@@ -1,54 +1,58 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import fitz  # PyMuPDF
 import cv2
 import numpy as np
-from PIL import Image
-import io
-import base64
+import tempfile
 import os
 
 app = Flask(__name__)
-os.makedirs("signatures", exist_ok=True)
 
-def convert_pdf_to_image(pdf_base64):
-    pdf_bytes = base64.b64decode(pdf_base64)
-    doc = fitz.open("pdf", pdf_bytes)
-    page = doc[0]
-    pix = page.get_pixmap(dpi=200)
-    img_bytes = pix.tobytes("png")
-    image = Image.open(io.BytesIO(img_bytes))
-    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+def extract_signature_from_pdf(pdf_path):
+    # Load the first page of the PDF as an image
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(0)
+    pix = page.get_pixmap()
+    
+    temp_img = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    pix.save(temp_img.name)
+    img = cv2.imread(temp_img.name)
 
-def detect_signature(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+    # Convert to grayscale and threshold
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+
+    # Find contours to detect handwriting-like content
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    signature_img = None
 
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        if 2 < w/h < 10 and 50 < w < 400:
-            return image[y:y+h, x:x+w]
-    return None
+        if w > 50 and h > 20 and w < 800 and h < 300:  # size filter
+            roi = img[y:y+h, x:x+w]
+            signature_img = roi
+            break
+
+    if signature_img is not None:
+        output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
+        cv2.imwrite(output_path, signature_img)
+        return output_path
+    else:
+        return None
 
 @app.route("/extract-signature", methods=["POST"])
 def extract_signature():
-    data = request.get_json()
-    file_type = data["file_type"]  # "pdf" or "image"
-    base64_data = data["file_data"]
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
 
-    if file_type == "pdf":
-        image = convert_pdf_to_image(base64_data)
-    else:
-        image_bytes = base64.b64decode(base64_data)
-        image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    file = request.files['file']
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
+        file.save(temp_pdf.name)
+        signature_path = extract_signature_from_pdf(temp_pdf.name)
 
-    signature = detect_signature(image)
-    if signature is not None:
-        filename = "signatures/signature.png"
-        cv2.imwrite(filename, signature)
-        return jsonify({"success": True, "message": "Signature saved", "file": filename})
-    else:
-        return jsonify({"success": False, "message": "Signature not found"})
+        if signature_path:
+            return send_file(signature_path, mimetype="image/png")
+        else:
+            return jsonify({"error": "Signature not found"}), 404
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
