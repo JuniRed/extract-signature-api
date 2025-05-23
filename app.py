@@ -1,9 +1,9 @@
 from flask import Flask, request, jsonify
-import base64
 import cv2
 import numpy as np
+import base64
 
-app = Flask(__name__)  # <----- must be defined first
+app = Flask(__name__)
 
 @app.route('/extract_signature', methods=['POST'])
 def extract_signature():
@@ -14,7 +14,7 @@ def extract_signature():
         return jsonify({"error": "No file_base64 provided"}), 400
 
     try:
-        # Decode base64 to image
+        # Decode base64 image
         file_bytes = base64.b64decode(base64_str)
         np_arr = np.frombuffer(file_bytes, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -22,44 +22,36 @@ def extract_signature():
         if img is None:
             return jsonify({"error": "Could not decode image"}), 400
 
+        # Convert to grayscale and blur to reduce noise
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
+        # Adaptive threshold for better contrast handling
         thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 15, 8
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 2
         )
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+        # Find external contours
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        signature_contours = []
-        for c in contours:
-            x, y, w, h = cv2.boundingRect(c)
-            aspect_ratio = w / float(h)
-            area = cv2.contourArea(c)
-            if 500 < area < 20000 and 2.0 < aspect_ratio < 6.0:
-                signature_contours.append(c)
+        # Filter contours by area (ignore small noise)
+        signature_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 1000]
 
         if not signature_contours:
             return jsonify({"error": "No signature-like region found"}), 400
 
-        x_min, y_min = float('inf'), float('inf')
-        x_max, y_max = 0, 0
-        for c in signature_contours:
-            x, y, w, h = cv2.boundingRect(c)
-            x_min = min(x_min, x)
-            y_min = min(y_min, y)
-            x_max = max(x_max, x + w)
-            y_max = max(y_max, y + h)
+        # Get the largest contour assumed to be signature
+        c = max(signature_contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(c)
+        signature_crop = img[y:y+h, x:x+w]
 
-        signature_crop = img[y_min:y_max, x_min:x_max]
-
+        # Convert to transparent PNG
         signature_rgba = cv2.cvtColor(signature_crop, cv2.COLOR_BGR2BGRA)
-        white_mask = np.all(signature_rgba[:, :, :3] > [240, 240, 240], axis=-1)
-        signature_rgba[white_mask, 3] = 0
+        white = np.all(signature_rgba[:, :, :3] == [255, 255, 255], axis=-1)
+        signature_rgba[white, 3] = 0
 
+        # Encode to PNG base64
         _, buffer = cv2.imencode('.png', signature_rgba)
         b64_output = base64.b64encode(buffer).decode('utf-8')
 
