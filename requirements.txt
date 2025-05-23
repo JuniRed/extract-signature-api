@@ -1,10 +1,6 @@
 Flask
-opencv-python-headless
-gunicorn
 opencv-python
+Pillow
 numpy
 PyMuPDF
-Pillow
-pdf2image
-flask
 requests
