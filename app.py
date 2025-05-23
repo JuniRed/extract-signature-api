@@ -1,3 +1,10 @@
+from flask import Flask, request, jsonify
+import base64
+import cv2
+import numpy as np
+
+app = Flask(__name__)  # <----- must be defined first
+
 @app.route('/extract_signature', methods=['POST'])
 def extract_signature():
     data = request.get_json()
@@ -15,23 +22,18 @@ def extract_signature():
         if img is None:
             return jsonify({"error": "Could not decode image"}), 400
 
-        # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Apply adaptive thresholding
         thresh = cv2.adaptiveThreshold(
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV, 15, 8
         )
 
-        # Morphological closing to clean noise
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        # Find external contours
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Filter contours by size
         signature_contours = []
         for c in contours:
             x, y, w, h = cv2.boundingRect(c)
@@ -43,7 +45,6 @@ def extract_signature():
         if not signature_contours:
             return jsonify({"error": "No signature-like region found"}), 400
 
-        # Get bounding box around all matching contours
         x_min, y_min = float('inf'), float('inf')
         x_max, y_max = 0, 0
         for c in signature_contours:
@@ -53,15 +54,12 @@ def extract_signature():
             x_max = max(x_max, x + w)
             y_max = max(y_max, y + h)
 
-        # Crop signature region
         signature_crop = img[y_min:y_max, x_min:x_max]
 
-        # Convert to PNG with transparent background
         signature_rgba = cv2.cvtColor(signature_crop, cv2.COLOR_BGR2BGRA)
         white_mask = np.all(signature_rgba[:, :, :3] > [240, 240, 240], axis=-1)
         signature_rgba[white_mask, 3] = 0
 
-        # Encode and return as base64
         _, buffer = cv2.imencode('.png', signature_rgba)
         b64_output = base64.b64encode(buffer).decode('utf-8')
 
@@ -69,3 +67,6 @@ def extract_signature():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
