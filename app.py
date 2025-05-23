@@ -1,58 +1,84 @@
 from flask import Flask, request, jsonify
+from PIL import Image
 import cv2
 import numpy as np
-from PIL import Image
+import fitz  # PyMuPDF
 import io
 import base64
-from pdf2image import convert_from_bytes
+import requests
+from datetime import datetime
 
 app = Flask(__name__)
 
-def extract_signature(image_np):
+def convert_pdf_to_image(file_stream):
+    doc = fitz.open(stream=file_stream, filetype="pdf")
+    page = doc.load_page(0)  # first page
+    pix = page.get_pixmap()
+    img_bytes = pix.tobytes("png")
+    image = Image.open(io.BytesIO(img_bytes))
+    return image
+
+def extract_signature(image: Image.Image) -> Image.Image:
+    image_np = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    signature_contour = max(contours, key=cv2.contourArea)
 
-    signature = None
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        if w > 100 and h < 150:  # Filter small text, big blobs
-            cropped = image_np[y:y+h, x:x+w]
-            signature = Image.fromarray(cropped)
-            break
+    x, y, w, h = cv2.boundingRect(signature_contour)
+    signature_crop = image_np[y:y+h, x:x+w]
 
-    return signature
+    signature_image = Image.fromarray(signature_crop)
+    return signature_image
 
-@app.route('/extract_signature', methods=['POST'])
-def extract_signature_route():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
+def upload_to_sharepoint(image: Image.Image, filename: str):
+    sharepoint_url = "<YOUR_SHAREPOINT_UPLOAD_URL>"  # Replace this
+    access_token = "<YOUR_ACCESS_TOKEN>"  # Get via Azure AD
 
-    file = request.files['file']
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json;odata=verbose",
+        "Content-Type": "image/png"
+    }
+    response = requests.post(
+        sharepoint_url,
+        headers=headers,
+        data=buffered.getvalue()
+    )
+    return response.status_code, response.text
+
+@app.route("/extract-signature", methods=["POST"])
+def extract_signature_api():
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "No file uploaded"}), 400
+
     filename = file.filename.lower()
+    image = None
 
     try:
-        if filename.endswith('.pdf'):
-            pages = convert_from_bytes(file.read())
-            image = np.array(pages[0])  # First page only
+        if filename.endswith(".pdf"):
+            image = convert_pdf_to_image(file.stream)
         else:
-            img_bytes = file.read()
-            np_arr = np.frombuffer(img_bytes, np.uint8)
-            image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = Image.open(file.stream)
 
-        sig_img = extract_signature(image)
-        if sig_img:
-            buffer = io.BytesIO()
-            sig_img.save(buffer, format='PNG')
-            base64_img = base64.b64encode(buffer.getvalue()).decode('utf-8')
-            return jsonify({'signature_image': base64_img})
+        signature = extract_signature(image)
+
+        now = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        image_filename = f"signature_{now}.png"
+
+        status_code, msg = upload_to_sharepoint(signature, image_filename)
+
+        if status_code == 200 or status_code == 201:
+            return jsonify({"message": "Signature extracted and uploaded successfully", "filename": image_filename}), 200
         else:
-            return jsonify({'error': 'Signature not found'}), 404
+            return jsonify({"error": "Failed to upload to SharePoint", "details": msg}), 500
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)
