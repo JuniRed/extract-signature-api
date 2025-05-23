@@ -80,6 +80,9 @@ def extract_signature_api():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+if __name__ == "__main__":
+    app.run(debug=True)
+
 # For production use with gunicorn
 # No need to call app.run()
 
