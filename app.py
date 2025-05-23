@@ -8,8 +8,8 @@ import base64
 
 app = Flask(__name__)
 
-def convert_pdf_to_image(file_stream):
-    doc = fitz.open(stream=file_stream, filetype="pdf")
+def convert_pdf_to_image(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(0)
     pix = page.get_pixmap()
     img_bytes = pix.tobytes("png")
@@ -32,16 +32,21 @@ def extract_signature(image: Image.Image) -> Image.Image:
 
 @app.route("/extract-signature", methods=["POST"])
 def extract_signature_api():
-    file = request.files.get("file")
-    if not file:
-        return jsonify({"error": "No file uploaded"}), 400
+    data = request.get_json()
+    if not data or "file_base64" not in data:
+        return jsonify({"error": "Missing 'file_base64' in request"}), 400
 
-    filename = file.filename.lower()
+    file_b64 = data["file_base64"]
+    
+    # Remove data URL prefix if present
+    if "," in file_b64:
+        file_b64 = file_b64.split(",", 1)[1]
+
     try:
-        if filename.endswith(".pdf"):
-            image = convert_pdf_to_image(file.stream)
-        else:
-            image = Image.open(file.stream)
+        file_bytes = base64.b64decode(file_b64)
+        is_pdf = file_bytes[:4] == b'%PDF'
+
+        image = convert_pdf_to_image(file_bytes) if is_pdf else Image.open(io.BytesIO(file_bytes))
 
         signature_image = extract_signature(image)
         buffer = io.BytesIO()
@@ -52,5 +57,3 @@ def extract_signature_api():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-# DO NOT use app.run() – use gunicorn on Render
