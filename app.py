@@ -1,3 +1,10 @@
+from flask import Flask, request, jsonify
+import cv2
+import numpy as np
+import base64
+
+app = Flask(__name__)
+
 @app.route('/extract_signature', methods=['POST'])
 def extract_signature():
     try:
@@ -32,10 +39,9 @@ def extract_signature():
             if aspect_ratio < 2.5 or h > img.shape[0] * 0.3:
                 continue
 
-            # Mean intensity in ROI (signatures are often dark)
             roi = gray[y:y+h, x:x+w]
             mean_intensity = np.mean(roi)
-            if mean_intensity > 180:  # too bright, likely background
+            if mean_intensity > 180:
                 continue
 
             candidates.append((cnt, area))
@@ -47,7 +53,6 @@ def extract_signature():
         x, y, w, h = cv2.boundingRect(best_cnt)
         signature_crop = img[y:y+h, x:x+w]
 
-        # Convert to transparent PNG
         signature_rgba = cv2.cvtColor(signature_crop, cv2.COLOR_BGR2BGRA)
         white = np.all(signature_rgba[:, :, :3] == [255, 255, 255], axis=-1)
         signature_rgba[white, 3] = 0
@@ -59,3 +64,6 @@ def extract_signature():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
