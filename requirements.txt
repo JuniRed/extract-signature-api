@@ -6,3 +6,4 @@ PyMuPDF
 gunicorn
 flask
 opencv-python-headless
+pdf2image
