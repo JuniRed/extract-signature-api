@@ -1,137 +1,84 @@
-from flask import Flask, request, jsonify, send_file, make_response
+from flask import Flask, request, jsonify
 import cv2
 import numpy as np
 import base64
-import io
 
 app = Flask(__name__)
 
-def decode_base64_image(img_b64):
-    """Decode a base64-encoded image to a BGR NumPy array."""
-    try:
-        img_data = base64.b64decode(img_b64)
-        img_array = np.frombuffer(img_data, np.uint8)
-        image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        return image
-    except Exception as e:
-        raise ValueError("Invalid image data") from e
-
-def preprocess_image(image):
-    """Convert to grayscale, denoise, and binarize to isolate dark strokes."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Blur to reduce noise
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Otsu's thresholding (invert so signature is white on black background):contentReference[oaicite:9]{index=9}.
-    _, binary = cv2.threshold(
-        blur, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
-    )
-    # Morphological opening (remove small noise) and closing (bridge signature strokes):contentReference[oaicite:10]{index=10}.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=2)
-    return closed
-
-def find_signature_contours(binary, image_shape):
-    """Find and filter contours likely to be the signature using heuristics."""
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    img_h, img_w = image_shape[:2]
-    candidates = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 100 or area > (img_w * img_h * 0.9):
-            # Skip tiny noise or huge background
-            continue
-        x, y, w, h = cv2.boundingRect(cnt)
-        aspect_ratio = float(w) / max(h, 1)
-        if aspect_ratio < 2.0:
-            # Signature is usually wider than tall:contentReference[oaicite:11]{index=11}
-            continue
-        extent = area / float(w * h)
-        if extent > 0.6:
-            # Likely not scribbly enough (too solid):contentReference[oaicite:12]{index=12}
-            continue
-        # Compute solidity
-        hull = cv2.convexHull(cnt)
-        hull_area = cv2.contourArea(hull)
-        if hull_area == 0:
-            continue
-        solidity = float(area) / hull_area
-        if solidity > 0.8:
-            # Too convex (e.g. stamp or solid shape):contentReference[oaicite:13]{index=13}
-            continue
-        # Check vertical position: ignore contours in top 30% of image
-        if y < img_h * 0.3:
-            continue
-        candidates.append(cnt)
-    return candidates
-
-def build_signature_mask(contours, shape):
-    """Create a mask image (255 in signature region, 0 elsewhere) from contours."""
-    mask = np.zeros(shape[:2], dtype=np.uint8)
-    if not contours:
-        return mask
-    # Fill all candidate contours
-    cv2.drawContours(mask, contours, -1, color=255, thickness=cv2.FILLED)
-    return mask
-
-def create_transparent_signature(image, mask):
-    """
-    Create a BGRA image where pixels under the mask are kept (with alpha=255)
-    and all other pixels are transparent.
-    """
-    b, g, r = cv2.split(image)
-    # Mask the color channels
-    b = cv2.bitwise_and(b, mask)
-    g = cv2.bitwise_and(g, mask)
-    r = cv2.bitwise_and(r, mask)
-    # Use the mask itself as alpha channel (255 inside signature, 0 outside)
-    rgba = cv2.merge((b, g, r, mask))
-    return rgba
-
 @app.route('/extract_signature', methods=['POST'])
 def extract_signature():
+    data = request.get_json()
+    base64_str = data.get("file_base64")
+    if not base64_str:
+        return jsonify({"error": "No file_base64 provided"}), 400
+
     try:
-        data = request.get_json(force=True)
-        if not data or 'image' not in data:
-            return jsonify({'error': 'Missing base64 image data'}), 400
+        # Decode base64 image
+        file_bytes = base64.b64decode(base64_str)
+        np_arr = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return jsonify({"error": "Could not decode image"}), 400
 
-        image = decode_base64_image(data['image'])
-        if image is None:
-            return jsonify({'error': 'Could not decode image'}), 400
+        height, width = img.shape[:2]
 
-        # Optionally resize large images for speed (e.g., max width=1200):contentReference[oaicite:14]{index=14}.
-        max_width = 1200
-        h, w = image.shape[:2]
-        if w > max_width:
-            scale = max_width / w
-            image = cv2.resize(image, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
+        # Focus on the bottom half where signatures usually appear
+        bottom_half = img[height // 2:, :]
 
-        # Preprocess to get a binary image of potential signatures
-        binary = preprocess_image(image)
+        # Convert to grayscale
+        gray = cv2.cvtColor(bottom_half, cv2.COLOR_BGR2GRAY)
 
-        # Find contours that may correspond to the signature
-        signature_contours = find_signature_contours(binary, image.shape)
+        # Blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # Adaptive thresholding
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 15, 4
+        )
+
+        # Morphological operations to enhance signature features
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # Find contours
+        contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Filter potential signature contours
+        signature_contours = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect_ratio = w / float(h)
+
+            if area > 500 and 1.5 < aspect_ratio < 10 and h > 15:
+                signature_contours.append((x, y, w, h))
+
         if not signature_contours:
-            return jsonify({'error': 'Signature not found'}), 404
+            return jsonify({"error": "No signature-like region found"}), 400
 
-        # Build mask and extract signature
-        mask = build_signature_mask(signature_contours, image.shape)
-        signature_rgba = create_transparent_signature(image, mask)
+        # Choose the largest by area
+        best_x, best_y, best_w, best_h = max(signature_contours, key=lambda b: b[2]*b[3])
 
-        # Encode RGBA image to PNG in memory
-        success, png = cv2.imencode('.png', signature_rgba)
-        if not success:
-            raise RuntimeError("Failed to encode PNG")
+        # Adjust Y since we sliced only bottom half
+        best_y += height // 2
 
-        # Return as PNG image response
-        buf = io.BytesIO(png.tobytes())
-        response = make_response(buf.getvalue())
-        response.headers.set('Content-Type', 'image/png')
-        return response
+        # Crop signature
+        signature_crop = img[best_y:best_y+best_h, best_x:best_x+best_w]
+
+        # Convert to transparent PNG (remove white background)
+        signature_rgba = cv2.cvtColor(signature_crop, cv2.COLOR_BGR2BGRA)
+        white = np.all(signature_rgba[:, :, :3] >= [240, 240, 240], axis=-1)
+        signature_rgba[white, 3] = 0
+
+        # Encode as base64 PNG
+        _, buffer = cv2.imencode('.png', signature_rgba)
+        b64_output = base64.b64encode(buffer).decode('utf-8')
+
+        return jsonify({"signature_base64": b64_output})
 
     except Exception as e:
-        # Log the error in real applications
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run()
+    app.run(debug=True)
