@@ -3,15 +3,15 @@ import cv2
 import numpy as np
 import base64
 
-app = Flask(__name__)  # ✅ this must be defined
+app = Flask(__name__)
 
 @app.route('/extract_signature', methods=['POST'])
 def extract_signature():
     try:
+        # Parse JSON and decode base64
         data = request.get_json()
-        print("Received data:", data)
-
         base64_str = data.get("file_base64")
+
         if not base64_str:
             return jsonify({"error": "Missing file_base64"}), 400
 
@@ -22,35 +22,56 @@ def extract_signature():
         if img is None:
             return jsonify({"error": "Could not decode image"}), 400
 
+        # Convert to grayscale and blur to reduce noise
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh = cv2.adaptiveThreshold(blurred, 255,
-                                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 11, 2)
 
+        # Adaptive threshold for signature contrast
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+
+        # Find contours
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        signature_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 1000]
 
-        if not signature_contours:
-            return jsonify({"error": "No signature found"}), 400
+        # Filter contours by size and aspect ratio
+        signature_candidates = []
 
-        c = max(signature_contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(c)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 3000 < area < 50000:  # Typical signature area range
+                x, y, w, h = cv2.boundingRect(cnt)
+                aspect_ratio = w / float(h)
+                if aspect_ratio > 2.5:  # Signatures are usually wide
+                    signature_candidates.append((cnt, area))
+
+        # Sort by area (largest likely most complete signature)
+        signature_candidates = sorted(signature_candidates, key=lambda x: x[1], reverse=True)
+
+        if not signature_candidates:
+            return jsonify({"error": "No signature-like region found"}), 400
+
+        # Extract best match
+        best_cnt, _ = signature_candidates[0]
+        x, y, w, h = cv2.boundingRect(best_cnt)
         signature_crop = img[y:y+h, x:x+w]
 
+        # Convert white background to transparent
         signature_rgba = cv2.cvtColor(signature_crop, cv2.COLOR_BGR2BGRA)
         white = np.all(signature_rgba[:, :, :3] == [255, 255, 255], axis=-1)
         signature_rgba[white, 3] = 0
 
+        # Encode to PNG base64
         _, buffer = cv2.imencode('.png', signature_rgba)
         b64_output = base64.b64encode(buffer).decode('utf-8')
 
         return jsonify({"signature_base64": b64_output})
 
     except Exception as e:
-        print("❌ Error:", str(e))
-        return jsonify({"error": "Server error", "details": str(e)}), 500
+        print("Error:", e)
+        return jsonify({"error": str(e)}), 500
 
-# ✅ This is required to start the app on Render
+# Run the app (important for Render)
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
