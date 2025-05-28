@@ -22,33 +22,36 @@ def extract_signature():
 
         # Preprocessing
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)  # Improve contrast
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         thresh = cv2.adaptiveThreshold(
             blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV, 11, 2
         )
 
-        # Morph open to remove noise
+        # Morph open + close to clean noise and connect ink
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        morph = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        morph = cv2.morphologyEx(morph, cv2.MORPH_CLOSE, kernel)
 
         # Find contours
-        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         signature_contours = []
 
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             area = cv2.contourArea(cnt)
             aspect_ratio = w / float(h) if h > 0 else 0
+            solidity = area / (w * h + 1e-5)  # prevent div by 0
 
-            # Filter based on area, aspect ratio, position
-            if area > 1000 and 1.5 < aspect_ratio < 10:
+            # Relaxed rules: area, aspect ratio, and ink density
+            if area > 800 and 0.5 < aspect_ratio < 12 and solidity > 0.1:
                 signature_contours.append(cnt)
 
         if not signature_contours:
             return jsonify({"error": "No signature-like region found"}), 400
 
-        # Get largest signature contour
+        # Get the largest signature contour
         c = max(signature_contours, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(c)
         signature_crop = img[y:y+h, x:x+w]
