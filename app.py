@@ -2,95 +2,71 @@ from flask import Flask, request, jsonify
 import cv2
 import numpy as np
 import base64
-import traceback
 
 app = Flask(__name__)
 
 @app.route('/extract_signature', methods=['POST'])
 def extract_signature():
     try:
-        data = request.get_json(force=True)
+        data = request.get_json()
         base64_str = data.get("file_base64")
-        debug = data.get("debug", False)
-
         if not base64_str:
-            return jsonify({"error": "Missing 'file_base64' in request"}), 400
+            return jsonify({"error": "No file_base64 provided"}), 400
 
-        # Decode base64 string to image
+        # Decode base64 to image
         file_bytes = base64.b64decode(base64_str)
         np_arr = np.frombuffer(file_bytes, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
         if img is None:
-            return jsonify({"error": "Invalid image data"}), 400
+            return jsonify({"error": "Could not decode image"}), 400
 
-        h_img, w_img = img.shape[:2]
-
-        # Convert to grayscale and preprocess
+        # Preprocessing
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+
+        # Morph open to remove noise
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
         # Find contours
         contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        signature_contours = []
 
-        signature_candidates = []
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             area = cv2.contourArea(cnt)
+            aspect_ratio = w / float(h) if h > 0 else 0
 
-            if area < 1000 or area > 0.3 * (h_img * w_img):
-                continue
-            if w > 0.9 * w_img or h > 0.3 * h_img:
-                continue
-            aspect_ratio = w / float(h)
-            if aspect_ratio < 2 or aspect_ratio > 8:
-                continue
-            if y < h_img * 0.3:
-                continue
-            mask = np.zeros(gray.shape, dtype=np.uint8)
-            cv2.drawContours(mask, [cnt], -1, 255, -1)
-            non_zero = cv2.countNonZero(mask[y:y+h, x:x+w])
-            solidity = non_zero / float(w * h)
-            if solidity < 0.2 or solidity > 0.9:
-                continue
+            # Filter based on area, aspect ratio, position
+            if area > 1000 and 1.5 < aspect_ratio < 10:
+                signature_contours.append(cnt)
 
-            signature_candidates.append((cnt, area))
-
-        if not signature_candidates:
+        if not signature_contours:
             return jsonify({"error": "No signature-like region found"}), 400
 
-        # Choose largest valid contour
-        signature_cnt = max(signature_candidates, key=lambda x: x[1])[0]
-        x, y, w, h = cv2.boundingRect(signature_cnt)
+        # Get largest signature contour
+        c = max(signature_contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(c)
         signature_crop = img[y:y+h, x:x+w]
 
         # Convert to transparent PNG
         signature_rgba = cv2.cvtColor(signature_crop, cv2.COLOR_BGR2BGRA)
-        white_pixels = np.all(signature_rgba[:, :, :3] >= [245, 245, 245], axis=-1)
-        signature_rgba[white_pixels, 3] = 0
+        white_mask = np.all(signature_rgba[:, :, :3] > 240, axis=-1)
+        signature_rgba[white_mask, 3] = 0
 
-        # Encode final signature image
+        # Encode result
         _, buffer = cv2.imencode('.png', signature_rgba)
-        signature_b64 = base64.b64encode(buffer).decode('utf-8')
+        b64_output = base64.b64encode(buffer).decode('utf-8')
 
-        response = {"signature_base64": signature_b64}
-
-        # Optional debug: send original image with bounding box
-        if debug:
-            debug_img = img.copy()
-            cv2.rectangle(debug_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            _, debug_buffer = cv2.imencode('.png', debug_img)
-            response["debug_image"] = base64.b64encode(debug_buffer).decode('utf-8')
-
-        return jsonify(response)
+        return jsonify({"signature_base64": b64_output})
 
     except Exception as e:
-        print("Exception occurred:", traceback.format_exc())
-        return jsonify({"error": "Server error: " + str(e)}), 500
+        return jsonify({"error": "Processing failed: " + str(e)}), 500
 
 
 if __name__ == '__main__':
-    app.run(debug=False, host="0.0.0.0", port=10000)
+    app.run(debug=True)
