@@ -2,98 +2,61 @@ from flask import Flask, request, jsonify
 import cv2
 import numpy as np
 import base64
-import tempfile
-import os
-from pdf2image import convert_from_bytes
+from io import BytesIO
 from PIL import Image
 
 app = Flask(__name__)
 
-def pdf_to_image(base64_str):
-    pdf_bytes = base64.b64decode(base64_str)
-    images = convert_from_bytes(pdf_bytes, dpi=300)
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
-        images[0].save(temp.name, format="PNG")
-        return cv2.imread(temp.name)
-
-def preprocess_image(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Apply slight blur to reduce noise
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Adaptive threshold to isolate ink
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 3
-    )
-    return thresh
-
-def find_signature_contour(thresh, img_height):
+def extract_signature(image_np):
+    """Basic signature extraction using OpenCV."""
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    signature_candidates = []
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        x, y, w, h = cv2.boundingRect(cnt)
-        aspect_ratio = w / float(h)
-
-        # Filter based on area and position
-        if 1000 < area < 50000 and aspect_ratio > 2 and y > img_height // 3:
-            signature_candidates.append((cnt, area))
-
-    if not signature_candidates:
-        return None
-
-    # Choose contour with the largest area
-    return max(signature_candidates, key=lambda x: x[1])[0]
-
-def extract_signature_image(img, contour):
-    x, y, w, h = cv2.boundingRect(contour)
-    signature = img[y:y+h, x:x+w]
-    
-    # Clean to white background
-    gray = cv2.cvtColor(signature, cv2.COLOR_BGR2GRAY)
-    _, alpha = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
-    b, g, r = cv2.split(signature)
-    rgba = [b, g, r, alpha]
-    signature_rgba = cv2.merge(rgba)
-
-    # Fill background as white
-    white_bg = np.ones_like(signature_rgba) * 255
-    signature_cleaned = np.where(signature_rgba[:, :, 3:] == 0, white_bg, signature_rgba)
-
-    return signature_cleaned.astype(np.uint8)
+    # Find largest contour (assumed signature)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(c)
+        signature = image_np[y:y+h, x:x+w]
+        return signature
+    return None
 
 @app.route('/extract_signature', methods=['POST'])
-def extract_signature():
-    data = request.get_json()
-    base64_str = data.get("file_base64")
-    if not base64_str:
-        return jsonify({"error": "No file_base64 provided"}), 400
-
+def extract_signature_api():
     try:
-        if base64_str.startswith("JVBER"):  # PDF magic header in base64
-            img = pdf_to_image(base64_str)
+        # Handle base64 image
+        if 'image_base64' in request.json:
+            img_data = request.json['image_base64']
+            img_bytes = base64.b64decode(img_data.split(',')[-1])
+            image = Image.open(BytesIO(img_bytes)).convert("RGB")
+            image_np = np.array(image)
+
+        # Handle file upload
+        elif 'file' in request.files:
+            file = request.files['file']
+            img_bytes = file.read()
+            file.stream.seek(0)  # Reset the file pointer in case it's needed again
+            image = Image.open(BytesIO(img_bytes)).convert("RGB")
+            image_np = np.array(image)
+
         else:
-            file_bytes = base64.b64decode(base64_str)
-            np_arr = np.frombuffer(file_bytes, np.uint8)
-            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            return jsonify({'error': 'No image data provided'}), 400
 
-        if img is None:
-            return jsonify({"error": "Could not decode input"}), 400
+        # Extract signature
+        signature = extract_signature(image_np)
+        if signature is None:
+            return jsonify({'error': 'No signature found'}), 404
 
-        thresh = preprocess_image(img)
-        contour = find_signature_contour(thresh, img.shape[0])
-
-        if contour is None:
-            return jsonify({"error": "No signature-like region found"}), 400
-
-        signature = extract_signature_image(img, contour)
+        # Encode extracted signature to base64
         _, buffer = cv2.imencode('.png', signature)
-        signature_b64 = base64.b64encode(buffer).decode('utf-8')
-        return jsonify({"signature_base64": signature_b64})
+        signature_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        return jsonify({
+            'signature_image': f'data:image/png;base64,{signature_base64}'
+        })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
