@@ -22,11 +22,13 @@ def extract_signature():
         if img is None:
             return jsonify({"error": "Could not decode image"}), 400
 
+        height, width = img.shape[:2]
+
         # Convert to grayscale and blur to reduce noise
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # Adaptive threshold for better contrast handling
+        # Adaptive threshold
         thresh = cv2.adaptiveThreshold(
             blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV, 11, 2
@@ -35,15 +37,24 @@ def extract_signature():
         # Find external contours
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Filter contours by area (ignore small noise)
-        signature_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 1000]
+        # Filter contours by area, aspect ratio, and vertical location
+        signature_candidates = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 500:  # ignore small noise
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect_ratio = w / float(h)
 
-        if not signature_contours:
+            if 2 < aspect_ratio < 10 and y > height * 0.5:
+                signature_candidates.append((cnt, area))
+
+        if not signature_candidates:
             return jsonify({"error": "No signature-like region found"}), 400
 
-        # Get the largest contour assumed to be signature
-        c = max(signature_contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(c)
+        # Choose the best candidate (by largest area)
+        best_cnt = max(signature_candidates, key=lambda x: x[1])[0]
+        x, y, w, h = cv2.boundingRect(best_cnt)
         signature_crop = img[y:y+h, x:x+w]
 
         # Convert to transparent PNG
