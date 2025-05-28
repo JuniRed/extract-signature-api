@@ -21,27 +21,32 @@ def extract_signature():
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 11, 2
-        )
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Morphological filter to connect handwriting strokes
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+        morph = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         candidates = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 1000 or area > 80000:
-                continue
+        height = img.shape[0]
 
+        for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
             aspect_ratio = w / float(h)
-            if aspect_ratio < 2.5 or h > img.shape[0] * 0.3:
+
+            if area < 800 or area > 70000:
                 continue
+            if aspect_ratio < 2.5 or aspect_ratio > 12:
+                continue
+            if y < height * 0.4:
+                continue  # likely not at bottom
 
             roi = gray[y:y+h, x:x+w]
-            mean_intensity = np.mean(roi)
-            if mean_intensity > 180:
+            stroke_density = np.count_nonzero(roi < 128) / (w * h)
+            if stroke_density < 0.03 or stroke_density > 0.5:
                 continue
 
             candidates.append((cnt, area))
@@ -53,8 +58,9 @@ def extract_signature():
         x, y, w, h = cv2.boundingRect(best_cnt)
         signature_crop = img[y:y+h, x:x+w]
 
+        # Remove white background
         signature_rgba = cv2.cvtColor(signature_crop, cv2.COLOR_BGR2BGRA)
-        white = np.all(signature_rgba[:, :, :3] == [255, 255, 255], axis=-1)
+        white = np.all(signature_rgba[:, :, :3] > [200, 200, 200], axis=-1)
         signature_rgba[white, 3] = 0
 
         _, buffer = cv2.imencode('.png', signature_rgba)
@@ -65,5 +71,3 @@ def extract_signature():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
