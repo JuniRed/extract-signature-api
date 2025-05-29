@@ -3,10 +3,12 @@ import cv2
 import numpy as np
 import base64
 import os
+from pdf2image import convert_from_bytes
+from PIL import Image
+from io import BytesIO
 
 app = Flask(__name__)
 
-# Optional: Set debug mode via environment or manual toggle
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 @app.route('/extract_signature', methods=['POST'])
@@ -17,12 +19,20 @@ def extract_signature():
         if not base64_str:
             return jsonify({"error": "No file_base64 provided"}), 400
 
-        # Decode base64
         file_bytes = base64.b64decode(base64_str)
+
+        # Try decoding as an image first
         np_arr = np.frombuffer(file_bytes, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        # If image decode fails, try treating it as PDF
         if img is None:
-            return jsonify({"error": "Could not decode image"}), 400
+            try:
+                pil_images = convert_from_bytes(file_bytes)
+                img_pil = pil_images[0]  # use the first page only
+                img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                return jsonify({"error": "Could not decode as image or PDF: " + str(e)}), 400
 
         # Preprocessing
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -42,31 +52,26 @@ def extract_signature():
 
         contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # First pass filtering (tight)
         signature_contours = filter_contours(contours, tight=True)
-
-        # Fallback: if no signature found, try more relaxed filter
         if not signature_contours:
             signature_contours = filter_contours(contours, tight=False)
 
         if not signature_contours:
             return jsonify({"error": "No signature-like region found"}), 400
 
-        # Choose the best contour
-        c = max(signature_contours, key=lambda c: cv2.contourArea(c))
+        # Choose the largest contour
+        c = max(signature_contours, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(c)
-        signature_crop = img[y:y+h, x:x+w]
+        signature_crop = img[y:y + h, x:x + w]
 
         # Transparent background
         signature_rgba = cv2.cvtColor(signature_crop, cv2.COLOR_BGR2BGRA)
         white_mask = np.all(signature_rgba[:, :, :3] > 240, axis=-1)
         signature_rgba[white_mask, 3] = 0
 
-        # Encode result
         _, buffer = cv2.imencode('.png', signature_rgba)
         b64_output = base64.b64encode(buffer).decode('utf-8')
 
-        # Optional debug return
         if DEBUG_MODE:
             return jsonify({
                 "signature_base64": b64_output,
@@ -88,12 +93,10 @@ def filter_contours(contours, tight=True):
         aspect_ratio = w / float(h) if h > 0 else 0
         solidity = area / float(w * h + 1e-5)
 
-        # Tight filter (for clean input)
         if tight:
             if area > 1000 and 0.5 < aspect_ratio < 10 and solidity > 0.15:
                 result.append(cnt)
         else:
-            # Loose filter (for faint or broken signatures)
             if area > 500 and 0.2 < aspect_ratio < 15 and solidity > 0.08:
                 result.append(cnt)
     return result
