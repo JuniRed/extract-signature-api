@@ -1,60 +1,45 @@
 from flask import Flask, request, jsonify
-import cv2
+import fitz  # PyMuPDF
 import numpy as np
+import cv2
 import base64
-import os # Added os for DEBUG folder
+import os
+import io
 
 app = Flask(__name__)
 
-# Added DEBUG and DEBUG_FOLDER from previous version for visualization
 DEBUG = True
 DEBUG_FOLDER = "debug_images"
 if DEBUG and not os.path.exists(DEBUG_FOLDER):
     os.makedirs(DEBUG_FOLDER)
 
-@app.route('/extract_signature', methods=['POST'])
-def extract_signature_api(): # Renamed function to avoid conflict with extract_signature logic
-    try:
-        data = request.get_json()
-        base64_str = data.get("file_base64")
-        if not base64_str:
-            return jsonify({"error": "No file_base64 provided"}), 400
+def pdf_to_image(pdf_bytes):
+    """Convert the first page of a PDF to a high-resolution image."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if doc.page_count == 0:
+        raise ValueError("PDF has no pages.")
+    page = doc.load_page(0)
+    zoom = 4  # 300 DPI equivalent
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    return img
 
-        # Decode base64 to image
-        file_bytes = base64.b64decode(base64_str)
-        np_arr = np.frombuffer(file_bytes, np.uint8)
-        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return jsonify({"error": "Could not decode image"}), 400
-
-        # Call the core extraction function
-        signature_img = extract_signature(img)
-
-        # Convert to transparent PNG and encode result
-        signature_rgba = cv2.cvtColor(signature_img, cv2.COLOR_BGR2BGRA)
-        # Use the mask generated in extract_signature for transparency
-        # Assuming extract_signature returns the color image and the mask
-        # We need to modify extract_signature to return the mask as well
-
-        # For now, let's re-generate a simple mask or assume the background is white for transparency
-        # A more robust approach would be to return the mask from extract_signature
-        gray_sig = cv2.cvtColor(signature_rgba, cv2.COLOR_BGR2GRAY)
-        _, alpha_mask = cv2.threshold(gray_sig, 240, 255, cv2.THRESH_BINARY_INV)
-        signature_rgba[:, :, 3] = alpha_mask
-
-
-        _, buffer = cv2.imencode('.png', signature_rgba)
-        b64_output = base64.b64encode(buffer).decode('utf-8')
-
-        return jsonify({"signature_base64": b64_output})
-
-    except Exception as e:
-        # Log the exception for better debugging
-        print(f"An error occurred: {e}")
-        return jsonify({"error": "Processing failed: " + str(e)}), 500
+def bytes_to_image(image_bytes):
+    """Convert image bytes to a NumPy array."""
+    np_arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Could not decode image bytes.")
+    return img
 
 def extract_signature(img):
     """Extract handwritten signature from image with refined filtering."""
+    if img is None or img.size == 0:
+         raise ValueError("Input image is empty.")
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if DEBUG:
         cv2.imwrite(os.path.join(DEBUG_FOLDER, "1_gray.png"), gray)
@@ -109,7 +94,9 @@ def extract_signature(img):
         max_solidity = 0.95 # Exclude very solid shapes (rectangles, thick lines)
 
         image_area = img.shape[0] * img.shape[1]
-        max_area = image_area * max_area_ratio
+        # Ensure image_area is not zero before division
+        max_area = image_area * max_area_ratio if image_area > 0 else float('inf')
+
 
         # Combined filtering criteria
         if (area > min_area and area < max_area and
@@ -140,18 +127,109 @@ def extract_signature(img):
         x_start = max(0, x - padding)
         x_end = min(img.shape[1], x + w + padding)
 
-        signature_color = img[y_start:y_end, x_start:x_end]
+        # Ensure valid slicing indices
+        if y_start >= y_end or x_start >= x_end:
+             signature_color = np.ones((50, 150, 3), dtype=np.uint8) * 255 # Return a small white image if crop is invalid
+        else:
+             signature_color = img[y_start:y_end, x_start:x_end]
 
     else:
         # If no significant contours are found, return a white image
         h, w = img.shape[:2]
-        signature_color = np.ones((h, w, 3), dtype=np.uint8) * 255
+        # Ensure dimensions are valid before creating white image
+        if h == 0 or w == 0:
+             signature_color = np.ones((50, 150, 3), dtype=np.uint8) * 255 # Return a small white image
+        else:
+            signature_color = np.ones((h, w, 3), dtype=np.uint8) * 255
 
     if DEBUG:
-        cv2.imwrite(os.path.join(DEBUG_FOLDER, "6_final_cropped_signature.png"), signature_color)
+        # Check if signature_color is empty before saving
+        if signature_color is not None and signature_color.size > 0:
+             cv2.imwrite(os.path.join(DEBUG_FOLDER, "6_final_cropped_signature.png"), signature_color)
+        else:
+             print("Debug: signature_color is empty, skipping save of 6_final_cropped_signature.png")
 
-    # Return the cropped color image. Transparency will be handled in the API route.
-    return signature_color
+
+    # Return the cropped color image and the mask for potential transparency handling outside
+    return signature_color, mask
+
+
+@app.route('/extract_signature', methods=['POST'])
+def extract_signature_api():
+    try:
+        data = request.get_json()
+        pdf_base64 = data.get("pdf_base64")
+        image_base64 = data.get("image_base64")
+
+        img = None
+        if pdf_base64:
+            pdf_bytes = base64.b64decode(pdf_base64)
+            img = pdf_to_image(pdf_bytes)
+        elif image_base64:
+            image_bytes = base64.b64decode(image_base64)
+            img = bytes_to_image(image_bytes)
+        else:
+            return jsonify({"error": "No pdf_base64 or image_base64 provided"}), 400
+
+        # Call the core extraction function, which now returns the cropped image and the mask
+        signature_img_color, signature_mask = extract_signature(img)
+
+        # Convert the extracted color image to RGBA for transparency
+        signature_rgba = cv2.cvtColor(signature_img_color, cv2.COLOR_BGR2BGRA)
+
+        # Resize the mask to match the cropped signature image dimensions
+        # This is necessary because the mask is generated on the original image dimensions
+        # and the signature_img_color is a cropped version.
+        # Find the bounding box of the mask on the original image to get the crop region
+        coords = cv2.findNonZero(signature_mask)
+        if coords is not None:
+             x, y, w, h = cv2.boundingRect(coords)
+             # Apply the same padding as used in extract_signature
+             padding = 15
+             y_start = max(0, y - padding)
+             y_end = min(signature_mask.shape[0], y + h + padding)
+             x_start = max(0, x - padding)
+             x_end = min(signature_mask.shape[1], x + w + padding)
+
+             # Ensure valid slicing indices
+             if y_start < y_end and x_start < x_end:
+                 cropped_mask = signature_mask[y_start:y_end, x_start:x_end]
+                 # Ensure the cropped mask has the same dimensions as the cropped color image
+                 if cropped_mask.shape[:2] == signature_rgba.shape[:2]:
+                     # Set the alpha channel using the cropped mask
+                     signature_rgba[:, :, 3] = cropped_mask
+                 else:
+                    # If dimensions don't match, fall back to simple white background transparency
+                    print("Debug: Cropped mask dimensions do not match cropped image. Falling back to simple transparency.")
+                    gray_sig = cv2.cvtColor(signature_rgba, cv2.COLOR_BGR2GRAY)
+                    _, alpha_mask = cv2.threshold(gray_sig, 240, 255, cv2.THRESH_BINARY_INV)
+                    signature_rgba[:, :, 3] = alpha_mask
+
+             else:
+                 # If cropping coordinates are invalid, fall back to simple white background transparency
+                 print("Debug: Invalid cropping coordinates for mask. Falling back to simple transparency.")
+                 gray_sig = cv2.cvtColor(signature_rgba, cv2.COLOR_BGR2GRAY)
+                 _, alpha_mask = cv2.threshold(gray_sig, 240, 255, cv2.THRESH_BINARY_INV)
+                 signature_rgba[:, :, 3] = alpha_mask
+
+        else:
+            # If no coordinates in mask, fall back to simple white background transparency
+            print("Debug: No coordinates found in mask. Falling back to simple transparency.")
+            gray_sig = cv2.cvtColor(signature_rgba, cv2.COLOR_BGR2GRAY)
+            _, alpha_mask = cv2.threshold(gray_sig, 240, 255, cv2.THRESH_BINARY_INV)
+            signature_rgba[:, :, 3] = alpha_mask
+
+
+        # Encode result
+        _, buffer = cv2.imencode('.png', signature_rgba)
+        b64_output = base64.b64encode(buffer).decode('utf-8')
+
+        return jsonify({"signature_base64": b64_output})
+
+    except Exception as e:
+        # Log the exception for better debugging
+        print(f"An error occurred: {e}")
+        return jsonify({"error": "Processing failed: " + str(e)}), 500
 
 
 if __name__ == '__main__':
