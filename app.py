@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 import base64
 import os
+import io
 
 app = Flask(__name__)
 
@@ -22,6 +23,14 @@ def pdf_to_image(pdf_bytes):
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
     if pix.n == 4:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    return img
+
+def bytes_to_image(image_bytes):
+    """Convert image bytes to a NumPy array."""
+    np_arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Could not decode image bytes.")
     return img
 
 def extract_signature(img):
@@ -75,22 +84,43 @@ def image_to_base64(img):
 @app.route('/extract-signature', methods=['POST'])
 def extract_signature_api():
     try:
+        img = None
         if 'file' in request.files:
-            pdf_file = request.files['file']
-            pdf_bytes = pdf_file.read()
-        else:
+            file = request.files['file']
+            filename = file.filename.lower()
+            file_bytes = file.read()
+            if filename.endswith('.pdf'):
+                img = pdf_to_image(file_bytes)
+            elif filename.endswith(('.png', '.jpg', '.jpeg')):
+                img = bytes_to_image(file_bytes)
+            else:
+                return jsonify({"error": "Unsupported file type. Please provide PDF, PNG, JPG, or JPEG."}), 400
+
+        elif request.get_json():
             data = request.get_json(force=True)
             pdf_base64 = data.get('pdf_base64', '')
-            if not pdf_base64:
-                return jsonify({"error": "No PDF provided"}), 400
-            pdf_bytes = base64.b64decode(pdf_base64)
-        
-        img = pdf_to_image(pdf_bytes)
+            image_base64 = data.get('image_base64', '')
+
+            if pdf_base64:
+                pdf_bytes = base64.b64decode(pdf_base64)
+                img = pdf_to_image(pdf_bytes)
+            elif image_base64:
+                image_bytes = base64.b64decode(image_base64)
+                img = bytes_to_image(image_bytes)
+            else:
+                return jsonify({"error": "No file or base64 data provided (expected 'file', 'pdf_base64', or 'image_base64')."}), 400
+        else:
+             return jsonify({"error": "No file or data provided."}), 400
+
+        if img is None:
+             return jsonify({"error": "Could not process input file or data."}), 400
+
+
         signature_img = extract_signature(img)
         signature_b64 = image_to_base64(signature_img)
 
         return jsonify({"signature_base64": signature_b64})
-    
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
