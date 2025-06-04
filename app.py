@@ -7,17 +7,16 @@ import os
 
 app = Flask(__name__)
 
-# Optional debug folder to save intermediate images
 DEBUG = True
 DEBUG_FOLDER = "debug_images"
 if DEBUG and not os.path.exists(DEBUG_FOLDER):
     os.makedirs(DEBUG_FOLDER)
 
 def pdf_to_image(pdf_bytes):
-    """Convert first page of PDF bytes to a high-res RGB image (numpy array)."""
+    """Convert the first page of a PDF to a high-resolution image."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(0)
-    zoom = 4  # high resolution
+    zoom = 4  # 300 DPI equivalent
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
@@ -26,50 +25,52 @@ def pdf_to_image(pdf_bytes):
     return img
 
 def extract_signature(img):
-    """Extract signature using enhanced processing with debug saves."""
+    """Extract handwritten signature from image with noise filtering."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if DEBUG:
         cv2.imwrite(os.path.join(DEBUG_FOLDER, "1_gray.png"), gray)
-    
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     if DEBUG:
-        cv2.imwrite(os.path.join(DEBUG_FOLDER, "2_blur.png"), blur)
-    
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        cv2.imwrite(os.path.join(DEBUG_FOLDER, "2_blur.png"), blurred)
+
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 15, 8
+    )
     if DEBUG:
         cv2.imwrite(os.path.join(DEBUG_FOLDER, "3_thresh.png"), thresh)
-    
+
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
+    mask = np.zeros_like(thresh)
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if 1000 < area < 50000:  # Adjust range as needed
+            cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
+
+    signature = cv2.bitwise_and(gray, gray, mask=mask)
+
+    signature_inv = cv2.bitwise_not(signature)
+    signature_color = cv2.cvtColor(signature_inv, cv2.COLOR_GRAY2BGR)
+
+    coords = cv2.findNonZero(mask)
+    if coords is not None:
+        x, y, w, h = cv2.boundingRect(coords)
+        signature_color = signature_color[y:y+h, x:x+w]
+    else:
         h, w = img.shape[:2]
-        return np.ones((h, w, 3), dtype=np.uint8) * 255
-
-    largest_contour = max(contours, key=cv2.contourArea)
-
-    if cv2.contourArea(largest_contour) < 500:
-        h, w = img.shape[:2]
-        return np.ones((h, w, 3), dtype=np.uint8) * 255
-
-    x, y, w, h = cv2.boundingRect(largest_contour)
-
-    roi = thresh[y:y+h, x:x+w]
-
-    signature = cv2.bitwise_not(roi)
-    
-    signature_color = cv2.cvtColor(signature, cv2.COLOR_GRAY2BGR)
+        signature_color = np.ones((h, w, 3), dtype=np.uint8) * 255
 
     if DEBUG:
-        cv2.imwrite(os.path.join(DEBUG_FOLDER, "4_signature.png"), signature_color)
+        cv2.imwrite(os.path.join(DEBUG_FOLDER, "4_final_signature.png"), signature_color)
 
     return signature_color
 
 def image_to_base64(img):
-    """Encode OpenCV image as base64 PNG string."""
+    """Encode image as base64 string."""
     _, buffer = cv2.imencode('.png', img)
-    img_bytes = buffer.tobytes()
-    base64_str = base64.b64encode(img_bytes).decode('utf-8')
-    return base64_str
+    return base64.b64encode(buffer).decode('utf-8')
 
 @app.route('/extract-signature', methods=['POST'])
 def extract_signature_api():
@@ -87,8 +88,9 @@ def extract_signature_api():
         img = pdf_to_image(pdf_bytes)
         signature_img = extract_signature(img)
         signature_b64 = image_to_base64(signature_img)
-        
+
         return jsonify({"signature_base64": signature_b64})
+    
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
