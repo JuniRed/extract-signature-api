@@ -59,21 +59,34 @@ def extract_signature(img):
     contours, _ = cv2.findContours(morphed_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mask = np.zeros_like(thresh)
 
-    # Filter contours based on area and aspect ratio
+    # Filter contours based on area, aspect ratio, and solidity
     for contour in contours:
         area = cv2.contourArea(contour)
+        if area == 0: # Avoid division by zero
+            continue
+
         x, y, w, h = cv2.boundingRect(contour)
         # Calculate aspect ratio (width / height)
         aspect_ratio = w / float(h) if h != 0 else 0
 
-        # Adjust area and aspect ratio ranges based on typical signature characteristics
+        # Calculate solidity
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = float(area) / hull_area if hull_area > 0 else 0
+
+        # Adjust filtering parameters based on typical signature characteristics
         # These values might need further tuning based on your specific images
         min_area = 50
         max_area = 50000
         min_aspect_ratio = 0.1 # Allow relatively tall and thin strokes
-        max_aspect_ratio = 10.0 # Allow relatively wide and short strokes, but exclude very long lines
+        max_aspect_ratio = 10.0 # Allow relatively wide and short strokes
+        min_solidity = 0.3 # Exclude very irregular shapes (might be noise)
+        max_solidity = 0.9 # Exclude very solid shapes (like rectangles or lines)
 
-        if min_area < area < max_area and min_aspect_ratio < aspect_ratio < max_aspect_ratio:
+
+        if (min_area < area < max_area and
+            min_aspect_ratio < aspect_ratio < max_aspect_ratio and
+            min_solidity < solidity < max_solidity):
              cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
 
 
