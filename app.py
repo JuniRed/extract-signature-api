@@ -1,101 +1,115 @@
 from flask import Flask, request, jsonify
-import cv2
+import fitz  # PyMuPDF
 import numpy as np
+import cv2
 import base64
-import os
-from pdf2image import convert_from_bytes
+import io
 from PIL import Image
-from io import BytesIO
 
 app = Flask(__name__)
-DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
-@app.route('/extract_signature', methods=['POST'])
-def extract_signature():
+def pdf_to_image(pdf_bytes):
+    """Convert first page of PDF bytes to RGB image (numpy array)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc.load_page(0)  # first page
+    zoom = 3  # zoom factor for better resolution
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n == 4:  # RGBA to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    return img
+
+def extract_signature(img):
+    """
+    Extract handwritten signature from image by:
+    - converting to grayscale,
+    - adaptive thresholding,
+    - morphological operations to isolate dark ink,
+    - contour detection to find the signature,
+    - cropping and cleaning background.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Invert image so signature is white on black background
+    inv = cv2.bitwise_not(gray)
+    
+    # Adaptive threshold to isolate signature strokes
+    thresh = cv2.adaptiveThreshold(inv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 25, 15)
+    
+    # Morphological closing to join broken parts of the signature
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    
+    # Find contours and filter by area (remove noise)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # If no contours, return blank white image
+    if not contours:
+        h, w = img.shape[:2]
+        return np.ones((h, w), dtype=np.uint8) * 255
+    
+    # Find bounding box around all contours combined
+    x_min = min([cv2.boundingRect(c)[0] for c in contours])
+    y_min = min([cv2.boundingRect(c)[1] for c in contours])
+    x_max = max([cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in contours])
+    y_max = max([cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in contours])
+    
+    # Crop to bounding box
+    signature_roi = closed[y_min:y_max, x_min:x_max]
+    
+    # Create white background image
+    bg = np.ones_like(signature_roi) * 255
+    
+    # Invert signature ROI to black strokes on white
+    signature_img = cv2.bitwise_not(signature_roi)
+    
+    # Convert to 3 channel BGR image for saving/display
+    signature_img_color = cv2.cvtColor(signature_img, cv2.COLOR_GRAY2BGR)
+    
+    return signature_img_color
+
+def image_to_base64(img):
+    """Convert OpenCV image (BGR) to base64 PNG string."""
+    _, buffer = cv2.imencode('.png', img)
+    img_bytes = buffer.tobytes()
+    base64_str = base64.b64encode(img_bytes).decode('utf-8')
+    return base64_str
+
+@app.route('/extract-signature', methods=['POST'])
+def extract_signature_api():
+    """
+    POST endpoint to receive PDF and return extracted signature.
+    
+    Accepts multipart/form-data with key 'file' (PDF),
+    or JSON with 'pdf_base64' key containing base64 PDF string.
+    
+    Returns JSON: { "signature_base64": "<base64 PNG>" }
+    """
     try:
-        data = request.get_json()
-        base64_str = data.get("file_base64")
-        if not base64_str:
-            return jsonify({"error": "No file_base64 provided"}), 400
-
-        file_bytes = base64.b64decode(base64_str)
-
-        # Decode as image or PDF
-        np_arr = np.frombuffer(file_bytes, np.uint8)
-        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        if img is None:
-            try:
-                pil_images = convert_from_bytes(file_bytes)
-                img_pil = pil_images[0]
-                img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-            except Exception as e:
-                return jsonify({"error": "Invalid image/PDF: " + str(e)}), 400
-
-        # Step 1: Grayscale + Blur
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-
-        # Step 2: Adaptive threshold to detect strokes (inverted)
-        thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY_INV, 15, 10
-        )
-
-        # Step 3: Remove small noise
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-
-        # Step 4: Find contours
-        contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        h, w = gray.shape
-        total_area = w * h
-
-        signature_mask = np.zeros_like(gray)
-
-        for cnt in contours:
-            x, y, cw, ch = cv2.boundingRect(cnt)
-            area = cv2.contourArea(cnt)
-            aspect_ratio = cw / float(ch) if ch > 0 else 0
-            arc_len = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.01 * arc_len, True)
-
-            # Signature-like features
-            if (
-                500 < area < 0.03 * total_area and
-                2 < aspect_ratio < 10 and
-                len(approx) > 15
-            ):
-                cv2.drawContours(signature_mask, [cnt], -1, 255, -1)
-
-        if np.count_nonzero(signature_mask) == 0:
-            return jsonify({"error": "No signature detected"}), 400
-
-        # Step 5: Crop to signature
-        ys, xs = np.where(signature_mask == 255)
-        x_min, x_max = np.min(xs), np.max(xs)
-        y_min, y_max = np.min(ys), np.max(ys)
-        cropped_img = img[y_min:y_max, x_min:x_max]
-        cropped_mask = signature_mask[y_min:y_max, x_min:x_max]
-
-        # Step 6: Apply mask to make background transparent
-        signature_rgba = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2BGRA)
-        signature_rgba[cropped_mask == 0, 3] = 0  # Transparent where not signature
-
-        _, buffer = cv2.imencode('.png', signature_rgba)
-        b64_output = base64.b64encode(buffer).decode('utf-8')
-
-        if DEBUG_MODE:
-            return jsonify({
-                "signature_base64": b64_output,
-                "bbox": {"x": int(x_min), "y": int(y_min), "w": int(x_max - x_min), "h": int(y_max - y_min)},
-                "signature_pixels": int(np.count_nonzero(signature_mask))
-            })
-
-        return jsonify({"signature_base64": b64_output})
-
+        if 'file' in request.files:
+            pdf_file = request.files['file']
+            pdf_bytes = pdf_file.read()
+        else:
+            data = request.get_json(force=True)
+            pdf_base64 = data.get('pdf_base64', '')
+            if not pdf_base64:
+                return jsonify({"error": "No PDF file or base64 provided"}), 400
+            pdf_bytes = base64.b64decode(pdf_base64)
+        
+        # Convert PDF to image
+        img = pdf_to_image(pdf_bytes)
+        
+        # Extract signature image
+        signature_img = extract_signature(img)
+        
+        # Encode extracted signature as base64 PNG
+        signature_b64 = image_to_base64(signature_img)
+        
+        return jsonify({"signature_base64": signature_b64})
     except Exception as e:
-        return jsonify({"error": "Processing failed: " + str(e)}), 500
-
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
