@@ -34,7 +34,7 @@ def bytes_to_image(image_bytes):
     return img
 
 def extract_signature(img):
-    """Extract handwritten signature from image with noise filtering."""
+    """Extract handwritten signature from image with noise filtering and morphological operations."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if DEBUG:
         cv2.imwrite(os.path.join(DEBUG_FOLDER, "1_gray.png"), gray)
@@ -43,33 +43,48 @@ def extract_signature(img):
     if DEBUG:
         cv2.imwrite(os.path.join(DEBUG_FOLDER, "2_blur.png"), blurred)
 
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 15, 8
-    )
+    # Use Otsu's thresholding for better automatic threshold determination
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
     if DEBUG:
         cv2.imwrite(os.path.join(DEBUG_FOLDER, "3_thresh.png"), thresh)
 
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Add morphological operations to connect signature strokes and remove noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    morphed_thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    morphed_thresh = cv2.morphologyEx(morphed_thresh, cv2.MORPH_OPEN, kernel)
+    if DEBUG:
+        cv2.imwrite(os.path.join(DEBUG_FOLDER, "3a_morphed_thresh.png"), morphed_thresh)
+
+    contours, _ = cv2.findContours(morphed_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mask = np.zeros_like(thresh)
 
+    # Filter contours based on area and aspect ratio (optional, might need tuning)
     for contour in contours:
         area = cv2.contourArea(contour)
-        if 1000 < area < 50000:  # Adjust range as needed
-            cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
+        # You might need to adjust this range based on typical signature sizes
+        # Consider adding filtering based on aspect ratio if needed
+        if 50 < area < 50000: # Adjusted range, further tuning might be needed
+             cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
+
 
     signature = cv2.bitwise_and(gray, gray, mask=mask)
 
+    # Invert the signature colors to have dark signature on white background
     signature_inv = cv2.bitwise_not(signature)
     signature_color = cv2.cvtColor(signature_inv, cv2.COLOR_GRAY2BGR)
 
+    # Find the bounding box of the extracted signature
     coords = cv2.findNonZero(mask)
     if coords is not None:
         x, y, w, h = cv2.boundingRect(coords)
+        # Crop the signature image to the bounding box
         signature_color = signature_color[y:y+h, x:x+w]
     else:
+        # If no signature is found, return a white image
         h, w = img.shape[:2]
         signature_color = np.ones((h, w, 3), dtype=np.uint8) * 255
+
 
     if DEBUG:
         cv2.imwrite(os.path.join(DEBUG_FOLDER, "4_final_signature.png"), signature_color)
@@ -78,6 +93,9 @@ def extract_signature(img):
 
 def image_to_base64(img):
     """Encode image as base64 string."""
+    # Ensure the image is not empty before encoding
+    if img is None or img.size == 0:
+        return ""
     _, buffer = cv2.imencode('.png', img)
     return base64.b64encode(buffer).decode('utf-8')
 
@@ -91,10 +109,10 @@ def extract_signature_api():
             file_bytes = file.read()
             if filename.endswith('.pdf'):
                 img = pdf_to_image(file_bytes)
-            elif filename.endswith(('.png', '.jpg', '.jpeg')):
+            elif filename.endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')): # Added more image types
                 img = bytes_to_image(file_bytes)
             else:
-                return jsonify({"error": "Unsupported file type. Please provide PDF, PNG, JPG, or JPEG."}), 400
+                return jsonify({"error": "Unsupported file type. Please provide PDF, PNG, JPG, JPEG, BMP, or TIFF."}), 400
 
         elif request.get_json():
             data = request.get_json(force=True)
@@ -115,13 +133,14 @@ def extract_signature_api():
         if img is None:
              return jsonify({"error": "Could not process input file or data."}), 400
 
-
         signature_img = extract_signature(img)
         signature_b64 = image_to_base64(signature_img)
 
         return jsonify({"signature_base64": signature_b64})
 
     except Exception as e:
+        # Log the exception for better debugging
+        print(f"An error occurred: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
