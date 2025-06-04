@@ -59,12 +59,21 @@ def extract_signature(img):
     contours, _ = cv2.findContours(morphed_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mask = np.zeros_like(thresh)
 
-    # Filter contours based on area and aspect ratio (optional, might need tuning)
+    # Filter contours based on area and aspect ratio
     for contour in contours:
         area = cv2.contourArea(contour)
-        # You might need to adjust this range based on typical signature sizes
-        # Consider adding filtering based on aspect ratio if needed
-        if 50 < area < 50000: # Adjusted range, further tuning might be needed
+        x, y, w, h = cv2.boundingRect(contour)
+        # Calculate aspect ratio (width / height)
+        aspect_ratio = w / float(h) if h != 0 else 0
+
+        # Adjust area and aspect ratio ranges based on typical signature characteristics
+        # These values might need further tuning based on your specific images
+        min_area = 50
+        max_area = 50000
+        min_aspect_ratio = 0.1 # Allow relatively tall and thin strokes
+        max_aspect_ratio = 10.0 # Allow relatively wide and short strokes, but exclude very long lines
+
+        if min_area < area < max_area and min_aspect_ratio < aspect_ratio < max_aspect_ratio:
              cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
 
 
@@ -74,12 +83,18 @@ def extract_signature(img):
     signature_inv = cv2.bitwise_not(signature)
     signature_color = cv2.cvtColor(signature_inv, cv2.COLOR_GRAY2BGR)
 
-    # Find the bounding box of the extracted signature
+    # Find the bounding box of the extracted signature based on the mask
     coords = cv2.findNonZero(mask)
     if coords is not None:
         x, y, w, h = cv2.boundingRect(coords)
         # Crop the signature image to the bounding box
-        signature_color = signature_color[y:y+h, x:x+w]
+        # Add some padding around the bounding box to ensure no parts are cut off
+        padding = 10
+        y_start = max(0, y - padding)
+        y_end = min(img.shape[0], y + h + padding)
+        x_start = max(0, x - padding)
+        x_end = min(img.shape[1], x + w + padding)
+        signature_color = signature_color[y_start:y_end, x_start:x_end]
     else:
         # If no signature is found, return a white image
         h, w = img.shape[:2]
