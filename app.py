@@ -8,7 +8,6 @@ from PIL import Image
 from io import BytesIO
 
 app = Flask(__name__)
-
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 @app.route('/extract_signature', methods=['POST'])
@@ -21,11 +20,9 @@ def extract_signature():
 
         file_bytes = base64.b64decode(base64_str)
 
-        # Try decoding as image first
+        # Decode as image or fallback to PDF
         np_arr = np.frombuffer(file_bytes, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-        # If not an image, try decoding as PDF
         if img is None:
             try:
                 pil_images = convert_from_bytes(file_bytes)
@@ -37,48 +34,57 @@ def extract_signature():
         # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        edges = cv2.Canny(blurred, 50, 150)
 
-        # Morphological filter to connect signature strokes
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        morph = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+        # Adaptive threshold + invert
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 15, 10
+        )
+
+        # Morph to connect strokes
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
 
         # Find contours
         contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Filter signature-like contours
-        img_h, img_w = gray.shape
-        img_area = img_w * img_h
+        # Filter contours with signature heuristics
+        h, w = gray.shape
+        total_area = w * h
         signature_contours = []
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            area = cv2.contourArea(cnt)
-            aspect_ratio = w / float(h) if h > 0 else 0
-            solidity = area / float(w * h + 1e-5)
-            length = cv2.arcLength(cnt, True)
 
-            # Signature-like filter: thin, long, low fill, enough complexity
-            if (500 < area < 0.05 * img_area and
-                2 < aspect_ratio < 15 and
-                0.05 < solidity < 0.5 and
-                length > 100):
+        for cnt in contours:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            aspect_ratio = cw / float(ch) if ch > 0 else 0
+            area = cv2.contourArea(cnt)
+            solidity = area / float(cw * ch + 1e-5)
+            arc_len = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.01 * arc_len, True)
+
+            if (
+                400 < area < 0.03 * total_area and
+                2 < aspect_ratio < 10 and
+                0.05 < solidity < 0.6 and
+                len(approx) > 20  # Curvy/complex
+            ):
                 signature_contours.append(cnt)
 
         if not signature_contours:
-            return jsonify({"error": "No signature found"}), 400
+            return jsonify({"error": "No signature detected"}), 400
 
-        # Mask and extract signature
+        # Get mask for signature
         mask = np.zeros_like(gray)
         cv2.drawContours(mask, signature_contours, -1, 255, -1)
 
-        # Get bounding box around signature
+        # Bounding box around signature
         x, y, w, h = cv2.boundingRect(np.vstack(signature_contours))
-        extracted = img[y:y+h, x:x+w]
-        mask_cropped = mask[y:y+h, x:x+w]
+        signature_crop = img[y:y+h, x:x+w]
+        mask_crop = mask[y:y+h, x:x+w]
 
-        # Make transparent background
-        signature_rgba = cv2.cvtColor(extracted, cv2.COLOR_BGR2BGRA)
-        signature_rgba[mask_cropped == 0, 3] = 0  # transparent where no signature
+        # Transparent background
+        signature_rgba = cv2.cvtColor(signature_crop, cv2.COLOR_BGR2BGRA)
+        signature_rgba[mask_crop == 0, 3] = 0
 
         _, buffer = cv2.imencode('.png', signature_rgba)
         b64_output = base64.b64encode(buffer).decode('utf-8')
@@ -94,6 +100,7 @@ def extract_signature():
 
     except Exception as e:
         return jsonify({"error": "Processing failed: " + str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True)
