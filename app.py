@@ -34,7 +34,7 @@ def bytes_to_image(image_bytes):
     return img
 
 def extract_signature(img):
-    """Extract handwritten signature from image with noise filtering and morphological operations."""
+    """Extract handwritten signature from image with noise filtering, morphological operations, and line removal."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if DEBUG:
         cv2.imwrite(os.path.join(DEBUG_FOLDER, "1_gray.png"), gray)
@@ -56,7 +56,32 @@ def extract_signature(img):
     if DEBUG:
         cv2.imwrite(os.path.join(DEBUG_FOLDER, "3a_morphed_thresh.png"), morphed_thresh)
 
-    contours, _ = cv2.findContours(morphed_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # --- Line detection and removal ---
+    # Use Hough Line Transform to detect lines
+    # Adjust parameters (rho, theta, threshold, minLineLength, maxLineGap) as needed
+    lines = cv2.HoughLinesP(morphed_thresh, 1, np.pi / 180, 100, minLineLength=100, maxLineGap=10)
+
+    # Create a black mask to draw lines on
+    line_mask = np.zeros_like(morphed_thresh)
+
+    # Draw detected lines on the line_mask
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(line_mask, (x1, y1), (x2, y2), 255, 5) # Draw lines in white with thickness 5
+
+    if DEBUG:
+        cv2.imwrite(os.path.join(DEBUG_FOLDER, "3b_line_mask.png"), line_mask)
+
+    # Subtract the line mask from the morphed threshold image
+    # This removes the detected lines from the potential signature areas
+    signature_候选 = cv2.bitwise_and(morphed_thresh, morphed_thresh, mask=cv2.bitwise_not(line_mask))
+    if DEBUG:
+        cv2.imwrite(os.path.join(DEBUG_FOLDER, "3c_signature_candidate.png"), signature_候选)
+    # --- End of Line detection and removal ---
+
+
+    contours, _ = cv2.findContours(signature_候选, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mask = np.zeros_like(thresh)
 
     # Filter contours based on area, aspect ratio, and solidity
